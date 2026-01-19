@@ -1,3 +1,13 @@
+import { emotionAnalyzer } from '@/lib/emotionAnalyzer';
+import { speak } from '@/lib/speechUtils';
+import { EMOTIONS } from '@/types/emotion';
+import {
+  showNoFaceDetectedMessage,
+  showAnalyzingLoader,
+  showInteractiveEmotionResult,
+} from '@/lib/emotionUI';
+import { recordVisitor } from '@/lib/visitorStats';
+
 type Cleanup = () => void;
 
 export function initCameraApp(): Cleanup {
@@ -59,6 +69,14 @@ export function initCameraApp(): Cleanup {
   const promptsList = document.getElementById("prompts-list") as HTMLDivElement | null;
   const closeModalBtn = document.getElementById("close-modal-btn") as HTMLButtonElement | null;
   const testShutterBtn = document.getElementById("test-shutter-btn") as HTMLButtonElement | null;
+  const faceZoomBtn = document.getElementById("face-zoom-btn") as HTMLButtonElement | null;
+  const statsPhotos = document.getElementById("stats-photos") as HTMLDivElement | null;
+  const statsResponses = document.getElementById("stats-responses") as HTMLDivElement | null;
+  const statsHappy = document.getElementById("stats-happy") as HTMLSpanElement | null;
+  const statsSatisfied = document.getElementById("stats-satisfied") as HTMLSpanElement | null;
+  const statsConfused = document.getElementById("stats-confused") as HTMLSpanElement | null;
+  const statsNotGreat = document.getElementById("stats-not-great") as HTMLSpanElement | null;
+  const statsResetBtn = document.getElementById("stats-reset-btn") as HTMLButtonElement | null;
   const promptsSidebarBtn = document.getElementById("prompts-sidebar-btn") as HTMLButtonElement | null;
   const promptsStatus = document.getElementById("prompts-status") as HTMLDivElement | null;
 
@@ -77,7 +95,8 @@ export function initCameraApp(): Cleanup {
     !promptsBtn ||
     !promptsModal ||
     !promptsList ||
-    !closeModalBtn
+    !closeModalBtn ||
+    !faceZoomBtn
   ) {
     return () => {};
   }
@@ -97,10 +116,292 @@ export function initCameraApp(): Cleanup {
   const promptsModalEl = promptsModal;
   const promptsListEl = promptsList;
   const closeModalBtnEl = closeModalBtn;
+  const faceZoomBtnEl = faceZoomBtn;
 
   let stream: MediaStream | null = null;
 
   type PromptItem = { text: string; imgs?: string[] };
+
+  type Box = { x: number; y: number; w: number; h: number };
+
+  let faceZoomEnabled = false;
+  let latestFace: Box | null = null;
+  let smoothedFace: Box | null = null;
+
+  const canUseFaceDetector = typeof window !== "undefined" && "FaceDetector" in window;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const FaceDetectorCtor = canUseFaceDetector ? (window as any).FaceDetector : null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const faceDetector: any = FaceDetectorCtor ? new FaceDetectorCtor({ fastMode: true, maxDetectedFaces: 1 }) : null;
+  let detectTimer: number | null = null;
+  let detectBusy = false;
+
+  const EVENT_NAME = process.env.NEXT_PUBLIC_EVENT_NAME;
+
+  type Mood = "happy" | "satisfied" | "confused" | "not_great";
+  type StatsV1 = {
+    photos: number;
+    responses: number;
+    mood: Record<Mood, number>;
+    categories: Record<string, number>;
+    updatedAt: number;
+  };
+
+  const STATS_KEY = "faceanalyzor_stats_v1";
+
+  function emptyStats(): StatsV1 {
+    return {
+      photos: 0,
+      responses: 0,
+      mood: { happy: 0, satisfied: 0, confused: 0, not_great: 0 },
+      categories: {},
+      updatedAt: Date.now()
+    };
+  }
+
+  function loadStats(): StatsV1 {
+    try {
+      const raw = localStorage.getItem(STATS_KEY);
+      if (!raw) return emptyStats();
+      const data = JSON.parse(raw) as Partial<StatsV1>;
+      const base = emptyStats();
+      return {
+        photos: Number.isFinite(data.photos) ? Number(data.photos) : base.photos,
+        responses: Number.isFinite(data.responses) ? Number(data.responses) : base.responses,
+        mood: {
+          happy: Number.isFinite(data.mood?.happy) ? Number(data.mood?.happy) : 0,
+          satisfied: Number.isFinite(data.mood?.satisfied) ? Number(data.mood?.satisfied) : 0,
+          confused: Number.isFinite(data.mood?.confused) ? Number(data.mood?.confused) : 0,
+          not_great: Number.isFinite(data.mood?.not_great) ? Number(data.mood?.not_great) : 0
+        },
+        categories: typeof data.categories === "object" && data.categories ? (data.categories as Record<string, number>) : {},
+        updatedAt: Number.isFinite(data.updatedAt) ? Number(data.updatedAt) : base.updatedAt
+      };
+    } catch {
+      return emptyStats();
+    }
+  }
+
+  function saveStats(s: StatsV1) {
+    s.updatedAt = Date.now();
+    localStorage.setItem(STATS_KEY, JSON.stringify(s));
+  }
+
+  function renderStats(s: StatsV1) {
+    if (statsPhotos) statsPhotos.textContent = String(s.photos);
+    if (statsResponses) statsResponses.textContent = String(s.responses);
+    if (statsHappy) statsHappy.textContent = String(s.mood.happy);
+    if (statsSatisfied) statsSatisfied.textContent = String(s.mood.satisfied);
+    if (statsConfused) statsConfused.textContent = String(s.mood.confused);
+    if (statsNotGreat) statsNotGreat.textContent = String(s.mood.not_great);
+  }
+
+  let stats = emptyStats();
+  function initStats() {
+    stats = loadStats();
+    renderStats(stats);
+    if (statsResetBtn) {
+      onEl(statsResetBtn, "click", () => {
+        stats = emptyStats();
+        saveStats(stats);
+        renderStats(stats);
+      });
+    }
+  }
+
+  function bumpPhotos() {
+    stats.photos += 1;
+    saveStats(stats);
+    renderStats(stats);
+  }
+
+  function bumpMood(mood: Mood) {
+    stats.responses += 1;
+    stats.mood[mood] += 1;
+    saveStats(stats);
+    renderStats(stats);
+  }
+
+  function bumpCategory(category: string) {
+    const key = category.trim().slice(0, 40);
+    if (!key) return;
+    stats.categories[key] = (stats.categories[key] ?? 0) + 1;
+    saveStats(stats);
+  }
+
+  function ensureOverlayRoot() {
+    let root = document.getElementById("analysis-overlay-root");
+    if (!root) {
+      root = document.createElement("div");
+      root.id = "analysis-overlay-root";
+      root.className = "fixed inset-0 pointer-events-none z-[11000]";
+      document.body.appendChild(root);
+    }
+    return root;
+  }
+
+
+  function showInsightSticker(input: { title: string; message: string }) {
+    const root = ensureOverlayRoot();
+    const sticker = document.createElement("div");
+    const tilt = (Math.random() * 10 - 5).toFixed(2);
+    const left = Math.round(18 + Math.random() * 220);
+    const bottom = Math.round(90 + Math.random() * 140);
+    const r1 = 40 + Math.round(Math.random() * 30);
+    const r2 = 30 + Math.round(Math.random() * 40);
+
+    sticker.className = "pointer-events-none fixed";
+    sticker.style.left = `${left}px`;
+    sticker.style.bottom = `${bottom}px`;
+    sticker.style.transform = `rotate(${tilt}deg) scale(0.95)`;
+    sticker.style.opacity = "0";
+
+    sticker.innerHTML = `
+      <div style="border-radius:${r1}% ${r2}% ${r1}% ${r2}% / ${r2}% ${r1}% ${r2}% ${r1}%;"
+        class="bg-gradient-to-br from-violet-500 to-fuchsia-500 text-white shadow-2xl px-4 py-3 w-[280px] max-w-[86vw]">
+        <div class="text-sm font-black tracking-wide">${escapeHtml(input.title)}</div>
+        <div class="text-xs opacity-95 mt-1 leading-relaxed">${escapeHtml(input.message)}</div>
+      </div>
+    `;
+
+    root.appendChild(sticker);
+    requestAnimationFrame(() => {
+      sticker.style.transition = "opacity 180ms ease-out, transform 220ms ease-out";
+      sticker.style.opacity = "1";
+      sticker.style.transform = `rotate(${tilt}deg) scale(1)`;
+    });
+
+    window.setTimeout(() => {
+      sticker.style.transition = "opacity 240ms ease-in, transform 240ms ease-in";
+      sticker.style.opacity = "0";
+      sticker.style.transform = `rotate(${tilt}deg) scale(0.92) translateY(10px)`;
+      window.setTimeout(() => sticker.remove(), 300);
+    }, 4500);
+  }
+
+  function escapeHtml(s: string) {
+    return s
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  function setFaceZoomEnabled(next: boolean) {
+    faceZoomEnabled = next;
+    updateFaceZoomButton();
+    if (!faceZoomEnabled) {
+      latestFace = null;
+      smoothedFace = null;
+    }
+  }
+
+  function updateFaceZoomButton() {
+    if (!faceDetector) {
+      faceZoomBtnEl.textContent = "FACE: N/A";
+      faceZoomBtnEl.disabled = true;
+      faceZoomBtnEl.classList.add("opacity-50", "cursor-not-allowed");
+      return;
+    }
+
+    faceZoomBtnEl.disabled = false;
+    faceZoomBtnEl.classList.remove("opacity-50", "cursor-not-allowed");
+    if (faceZoomEnabled) {
+      faceZoomBtnEl.textContent = "FACE: ON";
+      faceZoomBtnEl.classList.remove("border-emerald-500", "text-emerald-600");
+      faceZoomBtnEl.classList.add("border-emerald-700", "text-emerald-700", "bg-emerald-50");
+    } else {
+      faceZoomBtnEl.textContent = "FACE: OFF";
+      faceZoomBtnEl.classList.remove("border-emerald-700", "text-emerald-700", "bg-emerald-50");
+      faceZoomBtnEl.classList.add("border-emerald-500", "text-emerald-600");
+    }
+  }
+
+  function lerp(a: number, b: number, t: number) {
+    return a + (b - a) * t;
+  }
+
+  function smoothFaceBox(next: Box) {
+    const alpha = 0.35;
+    if (!smoothedFace) {
+      smoothedFace = next;
+      return;
+    }
+    smoothedFace = {
+      x: lerp(smoothedFace.x, next.x, alpha),
+      y: lerp(smoothedFace.y, next.y, alpha),
+      w: lerp(smoothedFace.w, next.w, alpha),
+      h: lerp(smoothedFace.h, next.h, alpha)
+    };
+  }
+
+  function clamp(v: number, min: number, max: number) {
+    return Math.max(min, Math.min(max, v));
+  }
+
+  function computeFaceCrop(videoW: number, videoH: number, targetW: number, targetH: number, face: Box) {
+    const aspect = targetW / targetH;
+    const cx = face.x + face.w / 2;
+    const cy = face.y + face.h / 2;
+
+    const desiredFaceRatio = 0.45;
+    let cropW = face.w / desiredFaceRatio;
+    let cropH = face.h / desiredFaceRatio;
+
+    if (cropW / cropH < aspect) cropW = cropH * aspect;
+    else cropH = cropW / aspect;
+
+    // Clamp to avoid absurd zoom / crop outside bounds.
+    const minCropW = Math.min(videoW, videoH * aspect) * 0.28;
+    const minCropH = Math.min(videoH, videoW / aspect) * 0.28;
+    cropW = clamp(cropW, minCropW, videoW);
+    cropH = clamp(cropH, minCropH, videoH);
+
+    let sx = cx - cropW / 2;
+    let sy = cy - cropH / 2;
+    sx = clamp(sx, 0, videoW - cropW);
+    sy = clamp(sy, 0, videoH - cropH);
+    return { sx, sy, sw: cropW, sh: cropH };
+  }
+
+  async function detectFaceOnce() {
+    if (!faceDetector) return;
+    if (!faceZoomEnabled) return;
+    if (detectBusy) return;
+    if (videoEl.readyState < 2) return;
+    if (!videoEl.videoWidth || !videoEl.videoHeight) return;
+
+    detectBusy = true;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const faces = (await faceDetector.detect(videoEl as any)) as Array<{ boundingBox: DOMRectReadOnly }>;
+      if (!faces || faces.length === 0) {
+        latestFace = null;
+        return;
+      }
+
+      const bb = faces[0].boundingBox;
+      latestFace = { x: bb.x, y: bb.y, w: bb.width, h: bb.height };
+      smoothFaceBox(latestFace);
+    } catch (e) {
+      console.warn("Face detect failed", e);
+    } finally {
+      detectBusy = false;
+    }
+  }
+
+  function startFaceLoop() {
+    if (!faceDetector) return;
+    if (detectTimer) return;
+    detectTimer = window.setInterval(() => {
+      void detectFaceOnce();
+    }, 200);
+    cleanups.push(() => {
+      if (detectTimer) window.clearInterval(detectTimer);
+      detectTimer = null;
+    });
+  }
 
   async function tryLoadPrompts() {
     if (promptsStatus) promptsStatus.textContent = "Loading prompts.json…";
@@ -184,7 +485,14 @@ export function initCameraApp(): Cleanup {
     }
     updateControls();
     applyCalibration();
+    updateFaceZoomButton();
+    startFaceLoop();
     void tryLoadPrompts();
+
+    // 表情分析モデルをバックグラウンドでプリロード
+    emotionAnalyzer.loadModels().catch((error) => {
+      console.warn('Failed to preload emotion analysis models:', error);
+    });
   }
 
   function applyCalibration() {
@@ -256,6 +564,49 @@ export function initCameraApp(): Cleanup {
     ctx.restore();
   }
 
+  async function analyzePhotoEmotion(imgUrl: string) {
+    const loader = showAnalyzingLoader();
+
+    try {
+      // モデルをプリロード（まだの場合）
+      if (!emotionAnalyzer.isModelLoaded()) {
+        await emotionAnalyzer.loadModels();
+      }
+
+      // 画像から表情を分析
+      const result = await emotionAnalyzer.analyzeEmotionFromBase64(imgUrl);
+
+      loader.hide();
+
+      if (!result) {
+        // 顔が検出されなかった
+        showNoFaceDetectedMessage();
+        speak('顔が検出されませんでした。');
+        return;
+      }
+
+      // 来場者を記録して統計を更新
+      const { visitorNumber, stats } = recordVisitor(result.emotion);
+
+      // インタラクティブな結果を表示
+      showInteractiveEmotionResult(result, visitorNumber, stats);
+
+      // 音声で読み上げ
+      const emotionData = EMOTIONS[result.emotion];
+      if (visitorNumber === 1) {
+        speak(`記念すべき最初のお客様です。${emotionData.description}。確信度は${result.confidence}パーセントです。`);
+      } else if (visitorNumber % 10 === 0) {
+        speak(`${visitorNumber}人目のお客様、ようこそ！${emotionData.description}。確信度は${result.confidence}パーセントです。`);
+      } else {
+        speak(`${visitorNumber}人目のお客様です。${emotionData.description}。確信度は${result.confidence}パーセントです。`);
+      }
+    } catch (error) {
+      loader.hide();
+      console.error('Emotion analysis failed:', error);
+      speak('表情分析に失敗しました。');
+    }
+  }
+
   function createPolaroidElement(imgUrl: string) {
     const id = `photo-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const div = document.createElement("div");
@@ -282,6 +633,7 @@ export function initCameraApp(): Cleanup {
     div.appendChild(card);
 
     printerSlotEl.appendChild(div);
+    bumpPhotos();
 
     onEl(div, "mousedown", startDrag);
     onEl(div, "touchstart", startDrag as unknown as (ev: TouchEvent) => void, { passive: false });
@@ -291,6 +643,9 @@ export function initCameraApp(): Cleanup {
     });
 
     setTimeout(() => div.classList.remove("developing"), 2200);
+
+    // 表情分析を実行
+    void analyzePhotoEmotion(imgUrl);
   }
 
   function takePhoto() {
@@ -314,16 +669,26 @@ export function initCameraApp(): Cleanup {
       const vR = videoEl.videoWidth / videoEl.videoHeight;
       const tR = targetW / targetH;
       let renderW: number, renderH: number, sx: number, sy: number;
-      if (vR > tR) {
-        renderH = videoEl.videoHeight;
-        renderW = renderH * tR;
-        sx = (videoEl.videoWidth - renderW) / 2;
-        sy = 0;
+
+      const face = faceZoomEnabled ? smoothedFace ?? latestFace : null;
+      if (face && face.w > 0 && face.h > 0) {
+        const crop = computeFaceCrop(videoEl.videoWidth, videoEl.videoHeight, targetW, targetH, face);
+        sx = crop.sx;
+        sy = crop.sy;
+        renderW = crop.sw;
+        renderH = crop.sh;
       } else {
-        renderW = videoEl.videoWidth;
-        renderH = renderW / tR;
-        sx = 0;
-        sy = (videoEl.videoHeight - renderH) / 2;
+        if (vR > tR) {
+          renderH = videoEl.videoHeight;
+          renderW = renderH * tR;
+          sx = (videoEl.videoWidth - renderW) / 2;
+          sy = 0;
+        } else {
+          renderW = videoEl.videoWidth;
+          renderH = renderW / tR;
+          sx = 0;
+          sy = (videoEl.videoHeight - renderH) / 2;
+        }
       }
       ctx.save();
       ctx.scale(-1, 1);
@@ -487,9 +852,11 @@ export function initCameraApp(): Cleanup {
   onEl(beautySliderEl, "input", () => {
     beautyValEl.innerText = beautySliderEl.value;
   });
+  onEl(faceZoomBtnEl, "click", () => setFaceZoomEnabled(!faceZoomEnabled));
   if (testShutterBtn) onEl(testShutterBtn, "click", playShutterSound);
 
   void initCamera();
+  initStats();
 
   return () => {
     cleanups.forEach((fn) => fn());

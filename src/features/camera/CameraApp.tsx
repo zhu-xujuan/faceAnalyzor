@@ -39,6 +39,14 @@ export function CameraApp() {
         </div>
 
         <button
+          id="face-zoom-btn"
+          className="bg-white border-2 border-emerald-500 text-emerald-600 px-5 py-2 rounded-full font-bold hover:bg-emerald-50 transition shadow-lg cursor-pointer select-none pointer-events-auto"
+          title="Auto center and zoom to face (when supported)"
+        >
+          FACE: OFF
+        </button>
+
+        <button
           id="prompts-btn"
           className="bg-white border-2 border-blue-500 text-blue-500 px-5 py-2 rounded-full font-bold hover:bg-blue-50 transition shadow-lg cursor-pointer select-none hidden pointer-events-auto"
         >
@@ -109,6 +117,60 @@ export function CameraApp() {
               Tip: camera + prompts work on <span className="font-mono">http://localhost</span>.
             </p>
           </div>
+
+          <div className="bg-white rounded-xl border border-gray-200 p-4 shadow-sm">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-gray-800">Stats (Local Only)</div>
+                <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 text-xs text-gray-700">
+                  <div className="text-gray-500">Photos</div>
+                  <div id="stats-photos" className="font-mono text-right">
+                    0
+                  </div>
+                  <div className="text-gray-500">Responses</div>
+                  <div id="stats-responses" className="font-mono text-right">
+                    0
+                  </div>
+                </div>
+                <div className="mt-3 text-xs text-gray-600 leading-relaxed">
+                  <div className="flex items-center justify-between gap-2">
+                    <span>😊 Happy</span>
+                    <span id="stats-happy" className="font-mono">
+                      0
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span>😌 Satisfied</span>
+                    <span id="stats-satisfied" className="font-mono">
+                      0
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span>🤔 Confused</span>
+                    <span id="stats-confused" className="font-mono">
+                      0
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span>😕 Not great</span>
+                    <span id="stats-not-great" className="font-mono">
+                      0
+                    </span>
+                  </div>
+                </div>
+              </div>
+              <button
+                id="stats-reset-btn"
+                className="px-3 py-2 rounded-lg bg-gray-100 text-gray-700 text-xs font-bold hover:bg-gray-200 transition select-none"
+                title="Reset local stats"
+              >
+                RESET
+              </button>
+            </div>
+            <p className="mt-3 text-xs text-gray-500 leading-relaxed">
+              Counts are stored only in this browser (no photo / no personal data saved).
+            </p>
+          </div>
         </div>
       </aside>
 
@@ -154,4 +216,3 @@ export function CameraApp() {
     </div>
   );
 }
-
